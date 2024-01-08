@@ -1,0 +1,338 @@
+---
+title: "Land Cover Classification"
+author: 'Noémie Wellinger'
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Chapter 7 of ' A Handful of pixels ' 
+
+Topic: Land Cover Classification using multidimensional data (spatial, temporal, multispectral).
+
+Goal of the exercise: classify a Swiss alpine scene into locations which have little seasonality and those which have some.
+
+
+---
+
+```{r libs, include=F}
+library(tidyr)
+library(terra)
+library(dplyr)
+```
+
+# Unsupervised Machine Learning
+## Downloading and Preprocessing
+```{r}
+# Download a larger data cube
+# note that I sample a 100x100 km
+# area around the lat/lon location
+lai_2012 <- MODISTools::mt_subset(
+  product = "MCD15A3H",
+  lat = 46.6756,
+  lon = 7.85480,
+  band = "Lai_500m",
+  start = "2012-01-01",
+  end = "2012-12-31",
+  km_lr = 100,
+  km_ab = 100,
+  site_name = "swiss",
+  internal = TRUE,
+  progress = TRUE
+)
+
+# save this data for later use
+# to speed up computation
+write.csv(lai_2012, "../data/lai_2012_MCD15A3H.csv")
+```
+If you have already downloaded the data previously, run this chunk
+```{r}
+lai_2012 <- read.csv("../data/lai_2012_MCD15A3H.csv")
+```
+
+```{r}
+# conversion from tidy data to a raster format
+# as it is common to use raster data
+r <- MODISTools::mt_to_terra(
+  lai_2012,
+  reproject = TRUE
+  )
+```
+
+Convert raster back into a wide dataframe, with rows = pixels and columns = timesteps
+```{r}
+# convert a multi-layer raster image
+# to wide dataframe
+df <- as.data.frame(r, cell = TRUE) # LAI for 2012 in 4-day timesteps (93 timesteps), 172'327 pixels
+
+# the content of a single feature (vector)
+# limited to the first 5 values for brevity
+print(df[1,1:5])
+```
+
+## Classification
+```{r}
+# cluster the data 
+clusters <- kmeans(
+  df[,-1], #drop first column of dataframe containing pixel indices
+  centers = 2 #k=2
+)
+```
+
+## Map
+```{r}
+# use the original raster layout as
+# a template for the new map (only
+# using a single layer)
+kmeans_map <- terra::rast(r, nlyr=1)
+
+# assign to each cell value (location) of this
+# new map using the previously exported cell
+# values (NA values are omitted so a 1:1
+# mapping would not work)
+kmeans_map[df$cell] <- clusters$cluster
+```
+
+```{r}
+library(leaflet)
+
+# set te colour scale manually
+palcol <- colorFactor(
+  c("#78d203", "#f9ffa4"),
+  domain = 1:2,
+  na.color = "transparent"
+  )
+
+# build the leaflet map
+leaflet() |> 
+  addProviderTiles(providers$Esri.WorldImagery, group = "World Imagery") |>
+  addProviderTiles(providers$Esri.WorldTopoMap, group = "World Topo") |>
+  addRasterImage(
+    kmeans_map,
+    colors = palcol,
+    opacity = 0.5,
+    method = "ngb",
+    group = "k-means cluster results"
+    ) |>
+  addLayersControl(
+    baseGroups = c("World Imagery","World Topo"),
+    position = "topleft",
+    options = layersControlOptions(collapsed = FALSE),
+    overlayGroups = c("k-means cluster results")
+    ) |>
+  addLegend(
+    colors = palcol(1:2),
+    values = c(1, 2),
+    title = "cluster",
+    labels = c(1, 2)
+    )
+```
+
+
+We end up with 2 classes, but do not really know what their land cover types. The model is therefore purely data informed, and not validated against external known Land-Use and Land-Cover locations.
+A visual inspection shows, that the k-means model splitted into vegetation (cluster 1) and glaciers, water bodies and urban ares (cluster 2).
+The model used seasonal differences in LAI, to split into areas with seasonal dynamic and areas without one.
+
+K-means is fast, but has only one parameter (k) --> too inflexible for complex classification tasks. 
+
+Also the LAI as a simple index does not provide sufficient information to distinguish between similar LULC classes (e.g. evergreen vs. mixed forests).
+
+We therefore need an approach that uses more data and a more sophisticated model approach.
+---
+
+# Supervised Machine Learning
+
+The supervised ML approach uses reference data to train the model.
+Generally ground truth data is used in order to create a training dataset (visually validated locations that belong to a particular LULC class).
+Here, we use a freely available crowdsourced (Geo-Wiki) dataset:
+```{r}
+# Read the validation sites from
+# Fritz et al. 2017 straight from
+# Zenodo.org
+validation_sites <- readr::read_csv(
+  "https://zenodo.org/record/6572482/files/Global%20LULC%20reference%20data%20.csv?download=1"
+)
+```
+
+Restrict the number of validation sites to a manageable number of 150 random locations for each Land-Use or Land-Cover class, limited to high quality locations on the northern hemisphere (as we will apply our analysis regionally to Switzerland)
+```{r}
+# filter out data by competition,
+# coverage percentage and latitude
+# (use round brackets to enclose complex
+# logical statements in a filter call!)
+validation_selection <- validation_sites |>
+    dplyr::filter(
+      (competition == 4 | competition == 1),
+      perc1 > 80, # quality over 80%
+      lat > 0 # only northern hemisphere
+    )
+
+# the above selection includes all data
+# but we now subsample to 150 random locations
+# per (group_by()) land cover class (LC1)
+# set a seed for reproducibilty
+set.seed(0)
+
+validation_selection <- validation_selection |>
+    dplyr::slice_sample(n = 150, by = LC1)
+
+# split validation selection
+# by land cover type into a nested
+# list, for easier processing
+# later on
+validation_selection <- validation_selection |>
+    dplyr::group_by(LC1) |>
+    dplyr::group_split()
+```
+
+```{r}
+# Set the username and password for the apeears API
+#keyring::key_set(service = "appeears",
+                 #username = "noewe")
+
+keyring::keyring_create("appeears", password = "i<3EarthData")
+# set a key to the keychain
+rs_set_key(
+  user = "noewe",
+  password = "i<3EarthData"
+  ) 
+
+# you can retrieve the password using
+rs_get_key(user = "noewe")
+
+# the output should be the key you provided
+```
+
+Gather multispectral data (four bands).
+```{r eval=FALSE}
+library(appeears)
+library(MODISTools)
+# for every row download the data for this
+# location and the specified reflectance
+# bands
+task_nbar <- lapply(validation_selection, function(x){
+  
+  # loop over all list items (i.e. land cover classes)
+  base_query <- x |>
+    dplyr::rowwise() |>
+    do({
+      data.frame(
+        task = paste0("nbar_lc_",.$LC1),
+        subtask = as.character(.$pixelID),
+        latitude = .$lat,
+        longitude = .$lon,
+        start = "2012-01-01",
+        end = "2012-12-31",
+        product = "MCD43A4.061",
+        layer = paste0("Nadir_Reflectance_Band", 1:4)
+      )
+    }) |>
+    dplyr::ungroup()
+  
+  # build a task JSON string 
+  task <- rs_build_task(
+    df = base_query
+  )
+  
+  # return task
+  return(task)
+})
+
+# Query the appeears API and process
+# data in batches - this function
+# requires an active API session/login
+rs_request_batch(
+  request = task_nbar,
+  workers = 10,
+  user = "noewe",
+  path = "C:/A_Noémie/Studium/HS23/AGDS-II/data/appeears_multispectral",
+  verbose = TRUE,
+  time_out = 28800
+)
+```
+
+With both training and model validation data downloaded we can now train a supervised machine learning model! We do have to wrangle the data into a format that is acceptable for machine learning tools. In particular, we need to convert the data from a long format to a wide format (see Section 1.4.1), where every row is a feature vector. The {vroom} package is used to efficiently read in a large amount of similar CSV files into a large dataframe using a single list of files (alternatively you can loop over and append files using base R).
+
+```{r}
+# list all MCD43A4 files, note that
+# that list.files() uses regular
+# expressions when using wildcards
+# such as *, you can convert general
+# wildcard use to regular expressions
+# with glob2rx()
+files <- list.files(
+  tempdir(),
+  glob2rx("*MCD43A4-061-results*"),
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+# read in the data (very fast)
+# with {vroom} and set all
+# fill values (>=32767) to NA
+nbar <- vroom::vroom(files)
+nbar[nbar >= 32767] <- NA
+
+# retain the required data only
+# and convert to a wide format
+nbar_wide <- nbar |>
+  dplyr::select(
+    Category,
+    ID,
+    Date,
+    Latitude,
+    Longitude,
+    starts_with("MCD43A4_061_Nadir")
+  ) |>
+  tidyr::pivot_wider(
+    values_from = starts_with("MCD43A4_061_Nadir"),
+    names_from = Date
+  )
+
+# split out only the site name,
+# and land cover class from the
+# selection of validation sites
+# (this is a nested list so we
+# bind_rows across the list)
+sites <- validation_selection |>
+  dplyr::bind_rows() |>
+  dplyr::select(
+    pixelID,
+    LC1
+  ) |>
+  dplyr::rename(
+    Category = "pixelID"
+  )
+
+# combine the NBAR and land-use
+# land-cover labels by location
+# id (Category)
+ml_df <- left_join(nbar_wide, sites) |>
+    dplyr::select(
+    LC1,
+    contains("band")
+  )
+```
+This example will try to follow the original MODIS MCD12Q1 workflow closely which calls for a boosted regression classification approach (Friedl et al. 2010). This method allows for the use of a combination of weak learners to be combined into a single robust ensemble classification models. 
+To properly evaluate or model we need to split our data in a true training dataset, and a test dataset. The test dataset will be used in the final model evaluation, where samples are independent of those contained within the training dataset (Boehmke and Greenwell 2020).
+
+## Model training
+```{r}
+# select packages
+# avoiding tidy catch alls
+library(rsample)
+
+# create a data split across
+# land cover classes
+ml_df_split <- ml_df |>
+  rsample::initial_split(
+  strata = LC1,
+  prop = 0.8
+)
+
+# select training and testing
+# data based on this split
+train <- rsample::training(ml_df_split)
+test <- rsample::testing(ml_df_split)
+```
+
+

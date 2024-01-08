@@ -1,0 +1,523 @@
+---
+title: "Phenology modelling"
+author: 'Noémie Wellinger'
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Theory:
+Machine learning: model structure has no or limited physical meaning. Complex and undefined (Physically speaking).
+Mechanistic models: Built in (physical) assumptions, domain knowledge, not fully deterministic.
+
+
+# Read in and preprocess phenology data
+```{r read, include = F}
+# I will use the phenocamr package which 
+# interfaces with the phenocam network API
+# to download time series of vegetation 
+# greenness and derived phenology metrics
+library(phenocamr)
+library(ggplot2)
+library(dplyr)
+library(GenSA)
+
+# download greenness time series,
+# calculate phenology (phenophases),
+# amend with DAYMET data
+phenocamr::download_phenocam(
+  site = "harvard$",
+  veg_type = "DB",
+  roi_id = "1000",
+  daymet = TRUE,
+  phenophase = TRUE,
+  trim = 2022,
+  out_dir = tempdir()
+  )
+
+harvard_phenocam_data <- readr::read_csv(
+  file.path(tempdir(), "harvard_DB_1000_3day.csv"), 
+  comment = "#"
+  )
+
+# reading in harvard phenology only retaining
+# spring (rising) phenology for the GCC 90th
+# percentile time series (the default)
+harvard_phenology <- readr::read_csv(
+  file.path(
+    tempdir(),
+    "harvard_DB_1000_3day_transition_dates.csv"
+    ),
+  comment = "#"
+) |>
+  dplyr::filter(
+    direction == "rising",
+    gcc_value == "gcc_90"
+  )
+```
+
+# Plot GCC (green chromatic coordinate) data
+GCC is basically a greenness index, total green over illuminance
+```{r plot, echo = F}
+ggplot(harvard_phenocam_data) +
+  geom_line(
+    aes(
+      as.Date(date),
+      smooth_gcc_90
+    ),
+    colour = "grey25"
+  ) +
+  geom_point(
+    data = harvard_phenology,
+    aes(
+      as.Date(transition_25),
+      threshold_25
+    )
+  ) +
+  labs(
+    x = "",
+    y = "GCC"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none"
+  )
+```
+
+# Calculate and plot GDD
+Growing degree days are defined as the cumulative sum of temperatures above a specified threshold (most commonly above 5°C).
+M is the date at which the summation is initiated.
+```{r}
+# return mean daily temperature as well
+# as formal dates (for plotting)
+harvard_temp <- harvard_phenocam_data |>
+  group_by(year) |>
+  dplyr::mutate(
+    tmean = (tmax..deg.c. + tmin..deg.c.)/2
+  ) |> 
+  dplyr::mutate(
+    date = as.Date(date),
+    gdd = cumsum(ifelse(tmean >= 5, tmean - 5, 0))
+  ) |>
+  dplyr::select(
+    date,
+    year,
+    tmean,
+    gdd
+  ) |>
+  dplyr::ungroup()
+
+# convert the harvard phenology data and only
+# retain required data
+harvard_phenology <- harvard_phenology |>
+  mutate(
+    doy = as.numeric(format(as.Date(transition_25),"%j")),
+    year = as.numeric(format(as.Date(transition_25),"%Y"))
+  ) |>
+  select(
+    year,
+    doy,
+    transition_25,
+    threshold_25
+    )
+```
+
+## Plot 
+```{r}
+# grab only the 2010 value of spring phenology
+harvard_phenology_2010 <- harvard_phenology |>
+  dplyr::filter(
+    year == 2010
+  )
+
+harvard_gdd_value <- harvard_temp |>
+  dplyr::filter(
+    date == harvard_phenology_2010$transition_25
+  )
+
+p <- ggplot(harvard_temp) +
+  geom_line(
+    aes(
+      date,
+      tmean
+    )
+  ) +
+  geom_point(
+    aes(
+      date,
+      tmean,
+      colour = tmean > 5,
+      group = 1
+    )
+  ) +
+  geom_vline(
+    data = harvard_phenology_2010,
+    aes(
+      xintercept = as.Date(transition_25)
+    )
+    ) +
+  scale_colour_discrete(
+    type = c(
+      "blue",
+      "red"
+      )
+  ) +
+  labs(
+    x = "",
+    y = "Temperature (deg. C)"
+  ) +
+  xlim(
+    c(
+    as.Date("2010-01-01"),
+    as.Date("2010-06-30")
+    )
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none"
+  )
+
+p2 <- ggplot(harvard_temp) +
+  geom_line(
+    aes(
+      date,
+      gdd
+    )
+  ) +
+  geom_point(
+    aes(
+      date,
+      gdd,
+      colour = tmean > 5,
+      group = 1
+    )
+  ) +
+  scale_colour_discrete(
+    type = c(
+      "blue",
+      "red"
+      )
+  ) +
+  geom_vline(
+    data = harvard_phenology_2010,
+    aes(
+      xintercept = as.Date(transition_25)
+      )
+    ) +
+  geom_hline(
+    data = harvard_gdd_value,
+    aes(
+      yintercept = gdd
+    ),
+    lty = 2
+    ) +
+  labs(
+    x = "",
+    y = "GDD (deg. C)"
+  ) +
+  xlim(
+    c(
+    as.Date("2010-01-01"),
+    as.Date("2010-06-30")
+    )
+  ) +
+  ylim(c(0, 1000)) +
+  theme_bw()  +
+  theme(
+    legend.position = "none"
+  )
+
+p
+p2
+```
+In the second figure we see that the spring phenology date in late April at 130.44°C GDD.
+But how do we generalize this to get a good model?
+
+# Growing degree day model optimization
+```{r}
+
+# temp: a temperature time series
+# par: two numbers: temperature threshold and critical GDD 
+# return: doy at which leaf out is predicted
+gdd_model <- function(temp, par) {
+  # split out parameters from a simple
+  # vector of parameter values
+  temp_threshold <- par[1]
+  gdd_crit <- par[2]
+  
+  # accumulate growing degree days for
+  # temperature data
+  gdd <- cumsum(ifelse(temp > temp_threshold, temp - temp_threshold, 0))
+  
+  # figure out when the number of growing
+  # degree days exceeds the minimum value
+  # required for leaf development, only
+  # return the first value
+  doy <- unlist(which(gdd >= gdd_crit)[1])
+  
+  return(doy)
+}
+```
+
+Let's run the model on our data from before
+```{r}
+# confirm that the model function
+# returns expected results (i.e. DOY 114)
+# (we filter out the year 2010, but
+# removing the filter would run the
+# model for all years!)
+prediction <- harvard_temp |>
+  dplyr::filter(
+    year == 2010
+  ) |>
+  group_by(year) |>
+  summarize(
+    pred = gdd_model(
+      temp = tmean,
+      par = c(5, 130.44)
+    )  
+  )
+
+print(prediction)
+```
+# Phenology model calibration
+How can we calibrate the model to get good predictions across sites and for other years?
+Minimize the error (a cost function) between the model results (for a given set of parameters, i.e. the temperature threshold and critical GDD) and our observed data obtained for multiple sites and years.
+
+Parameter optimization methods:
+- base-R nls() function, which implements a square error minimization for any (non-linear) function
+
+We will use the GenSA R package which relies on the simulated annealing method to illustrate the estimation of model parameters. 
+
+```{r}
+# run model and compare to true values
+# returns the RMSE
+rmse_gdd <- function(par, data) {
+  
+  # split out data
+  drivers <- data$drivers
+  validation <- data$validation
+  
+  # calculate phenology predictions
+  # and put in a data frame
+  predictions <- drivers |>
+    group_by(year) |>
+    summarise(
+      predictions = gdd_model(
+        temp = tmean,
+        par = par
+      )
+    )
+  
+  predictions <- left_join(predictions, validation, by = "year")
+  
+  rmse <- predictions |>
+    summarise(
+      rmse = sqrt(mean((predictions - doy)^2, na.rm = TRUE))
+    ) |>
+    pull(rmse)
+  
+  # return rmse value
+  return(rmse)
+}
+```
+
+```{r}
+# starting model parameters
+par = c(0, 130)
+
+# limits to the parameter space
+lower <- c(-10,0)
+upper <- c(45,500)
+
+# data needs to be provided in a consistent
+# single data file, a nested data structure
+# will therefore accept non standard data formats
+data <- list(
+  drivers = harvard_temp,
+  validation = harvard_phenology
+  )
+
+# optimize the model parameters
+optim_par = GenSA::GenSA(
+ par = par,
+ fn = rmse_gdd,
+ lower = lower,
+ upper = upper,
+ control = list(
+   max.call = 4000 # call the cost function 4000 times
+   ),
+ data = data
+)$par
+
+optim_par
+```
+# Run the model for all years
+```{r}
+# run the model for all years
+# to get the phenology predictions
+predictions <- harvard_temp |>
+  group_by(year) |>
+  summarize(
+   prediction = gdd_model(
+    temp = tmean,
+    par = optim_par
+  )  
+  )
+```
+
+```{r}
+# join predicted with observed data
+validation <- left_join(predictions, harvard_phenology)
+
+ggplot(validation) +
+  geom_smooth(
+    aes(
+      doy,
+      prediction
+    ),
+    colour = "grey25",
+    method = "lm"
+  ) +
+  geom_point(
+    aes(
+      doy,
+      prediction
+    )
+  ) +
+  geom_abline(
+    intercept=0, 
+    slope=1, 
+    linetype="dotted"
+    ) +
+  labs(
+    x = "Observed leaf-out date (DOY)",
+    y = "Predicted leaf-out date (DOY)"
+  ) +
+  theme_bw()  +
+  theme(
+    legend.position = "none"
+  )
+```
+
+# Spatial scaling
+Explore how the relationship between observed and predicted values scale across a larger landscape.
+We use DAYMET raster data to scale the results spatially
+```{r daymet, include = F}
+library(daymetr)
+
+# Download daily maximum and minimum data
+daymetr::download_daymet_tiles(
+  tiles = 11935,
+  start = 2012,
+  end = 2012,
+  param = c("tmin","tmax"),
+  path = paste0(here::here(), "/data-raw/"),
+  silent = TRUE
+  )
+
+# calculate the daily mean values
+r <- daymetr::daymet_grid_tmean(
+  path = paste0(here::here(), "/data-raw/"),
+  product = 11935,
+  year = 2012,
+  internal = TRUE
+)
+
+```
+
+Reproject the data to geographic coordinates and filter the first 180 days
+```{r reproject, include=F}
+# reproject to lat lon
+r <- terra::project(
+  r,
+  "+init=epsg:4326"
+)
+
+# subset to first 180 days
+ma_nh_temp <- terra::subset(
+  r,
+  1:180
+)
+```
+
+Apply our model to the datacube.
+How to ensure that a function is compatible with raster processing:
+- data argument comes first
+- then the function (model)
+- then the (optimal) parameters
+```{r}
+predicted_phenology <- terra::app(
+  ma_nh_temp,
+  fun = gdd_model,
+  par = optim_par
+)
+```
+
+Plot the results
+```{r}
+library(leaflet)
+
+# set te colour scale manually
+pal <- colorNumeric(
+  "magma",
+  values(predicted_phenology),
+  na.color = "transparent"
+  )
+
+# build the leaflet map
+# using ESRI tile servers
+# and the loaded demo raster
+leaflet() |> 
+  addProviderTiles(providers$Esri.WorldImagery, group = "World Imagery") |>
+  addProviderTiles(providers$Esri.WorldTopoMap, group = "World Topo") |>
+  addRasterImage(
+    predicted_phenology,
+    colors = pal,
+    opacity = 0.8,
+    group = "Phenology model results"
+    ) |>
+  addLayersControl(
+    baseGroups = c("World Imagery","World Topo"),
+    position = "topleft",
+    options = layersControlOptions(collapsed = FALSE),
+    overlayGroups = c("Phenology model results")
+    ) |>
+  addLegend(
+    pal = pal,
+    values = values(predicted_phenology),
+    title = "DOY")
+```
+
+
+# Exercises
+https://geco-bern.github.io/handfull_of_pixels/exercises.html
+
+## 8.2 Phenology modelling
+
+How can you improve the model used to regionally scale the results in Chapter 6?
+Provide at least three (3) ways to improve the model used.
+
+1. Use phenocam data of multiple sites. To train the model, divide the sites into training and validation set. Train the model and optimize the parameters on the training set and validate on the validation set.
+2. Use topographic data as well, i.e. m.a.s.l
+3. 
+
+### Implementation
+Use phenocam data of multiple sites. To train the model, divide the sites into training and validation set. Train the model and optimize the parameters on the training set and validate on the validation set.
+
+I selected 6 sites that are inside or close to the area we regionally upscale. All sites have the primary vegetation type Deciduous Broadleaf (primary_veg_type: DB). 
+Sites selected:
+* https://phenocam.nau.edu/webcam/sites/harvard/        Elev(m): 340
+* https://phenocam.nau.edu/webcam/sites/tfforest/       Elev(m): 23
+* https://phenocam.nau.edu/webcam/sites/hubbardbrook/   Elev(m): 253
+* https://phenocam.nau.edu/webcam/sites/bartlettir/     Elev(m): 268
+* https://phenocam.nau.edu/webcam/sites/montmegmsj/     Elev(m): 599
+* https://phenocam.nau.edu/webcam/sites/readingma/      Elev(m): 100
+
+Then, the goal is to apply the same optimization steps as before for the different years, but to different stations
+
+```{r}
+
+
+```
+
+Statistically compare the results with the MODIS MCD12Q2 phenology product
