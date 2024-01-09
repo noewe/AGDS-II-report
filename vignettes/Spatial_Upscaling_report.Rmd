@@ -1,37 +1,42 @@
 ---
 title: "Spatial Upscaling"
+subtitle: "Applied Geodata Science II, fall semester 2023"
 author: 'Noémie Wellinger'
 date: "`r Sys.Date()`"
-output: html_document
+output: 
+  html_document: 
+    toc: yes
+    fig_caption: yes
+    code_folding: "hide"
 ---
 
-# Background
-Spatial upscaling is one of the major challenges in modelling. 
+# 1. Background
 
-## Ludwig et al.
+## 1.1. Literature discussion: Ludwig et al. (2023)
 
 *Explain the difference between a random cross-validation and a spatial cross-validation.*
+
 Random and spatial cross-validation use different partitioning methods for the folds.
 For random cross-validation, the n folds are chosen randomly among the whole dataset.
-For spatial cross-validation, the data is partitioned into spatial clusters using a clustering algorithm. Spatial in this context can either mean geographical space (longitude, latitude, and, possibly, altitude), or feature space of the covariates.
-
+Spatial in the context of this paper means geographical space (longitude and latitude). For spatial cross-validation, the data is partitioned according to the "Euclidean geographic distance distribution between training data and all prediction locations" (Ludwig et al., 2023). In the approach they follow, each fold should consist of similar distances to the remaining reference data.
 
 *In spatial upscaling, we model the target based on environmental covariates. This implies that we assume the training data to sufficiently represent the conditions on which the model will be applied for generating predictions. Prediction errors may increase with an increasing distance of the prediction location from the training locations. The paper by Ludwig et al. (2023) considers this “distance” as a geographical distance in Euclidian space. Do you see an alternative to measuring a distance that considers the task of spatial upscaling based on environmental covariates more directly?*
-Rather than considering geographical space, use the feature space of the environmental covariates. In this case, Euclidian distance (or better, Normalized Euclidian distance, since the environmental covariates likely have different unit measures) would measure the similarity of the environment of the training locations. This is also done by Ludwig et al. (2023) ...
-There are also correlation-based distance measures, which
 
-## Data
+Rather than considering geographical space, use the feature space of the environmental covariates. In this case, Euclidian distance (or better, Normalized Euclidian distance, since the environmental covariates likely have different unit measures) would measure the similarity of the environment of the training locations. The folds would then contain data that is similar, making the folds dissimilar to each other. This is also done by Ludwig et al. (2023) using k-means clustering. However, they point out that this method of cross-validation is not suitable to estimate overall map accuracy.
+
+## 1.2 Data
 Observational leaf nitrogen (N) content. 
 Environmental covariates with global coverage (limited subset):
-* leafN: leaf nitrogen content, in mass-based concentration units (gN gDM)
-* lon: longitude in decimal degrees east
-* lat: latitude in decimal degrees north
-* elv: Elevation above sea level (m)
-* mat: mean annual temperature (degrees Celsius)
-* map: mean annual precipitation (mm yr)
-* ndep: atmospheric nitrogen deposition g m
-* yrmai: mean annual daily irradiance µmol m 
-* sSpecies: species name of the plant on which leaf N was measured
+
+- leafN: leaf nitrogen content, in mass-based concentration units (gN gDM)
+- lon: longitude in decimal degrees east
+- lat: latitude in decimal degrees north
+- elv: Elevation above sea level (m)
+- mat: mean annual temperature (degrees Celsius)
+- map: mean annual precipitation (mm yr)
+- ndep: atmospheric nitrogen deposition g m
+- yrmai: mean annual daily irradiance µmol m 
+- sSpecies: species name of the plant on which leaf N was measured
 
 ```{r libs, include=FALSE}
 source("../R/check_pkg.R")
@@ -67,17 +72,18 @@ skimr::skim(dfs)
 visdat::vis_miss(dfs)
 ```
 
-# Analysis
-## Random cross-validation
+# 2. Analysis
+## 2.1 Random cross-validation
 The aim is to use Random Forest to perform a 5-fold cross-validation with the leaf N data (leafN) and the following predictors: 
-* elv: Elevation above sea level (m)
-* mat: mean annual temperature (degrees Celsius)
-* map: mean annual precipitation (mm yr)
-* ndep: atmospheric nitrogen deposition g m
-* mai: mean annual daily irradiance µmol m 
-* Species: species name of the plant on which leaf N was measured
 
-Training and testing data are split in a 75%/25% proportion, with ´leafN´ as the stratification variable. This ensures that the distribution of the target variable (´leafN´) is similar in both the training and testing sets.
+- elv: Elevation above sea level (m)
+- mat: mean annual temperature (degrees Celsius)
+- map: mean annual precipitation (mm yr)
+- ndep: atmospheric nitrogen deposition g m
+- mai: mean annual daily irradiance µmol m 
+- Species: species name of the plant on which leaf N was measured
+
+Training and testing data are split in a 75%/25% proportion, with `leafN` as the stratification variable. This ensures that the distribution of the target variable (`leafN`) is similar in both the training and testing sets.
 
 ```{r model_prep, include = F}
 # Specify target: The pH in the top 10cm
@@ -97,8 +103,8 @@ predictors_all <- c("elv", "mat", "map", "ndep", "mai", "Species")
 # df_test <- df_test   |> tidyr::drop_na()
 ```
 
-
-```{r}
+Using the `ranger` package, a Random Forest model was fitted with random 5-fold cross-validation.
+```{r fit_random_model, class.source = "fold-hide", message = F}
 # The same model formulation is in the previous chapter
 pp <- recipes::recipe(leafN ~ elv + mat + map + ndep + mai + Species, 
                       data = dfs) |> 
@@ -120,25 +126,11 @@ mod_rn_cv <- caret::train(
   num.trees = 500,    # high number ok since no hyperparam tuning
   seed = 32 # for reproducibility
 )
-
-# Print a summary of fitted model
-#print(mod_rn_cv)
-mod_rn_cv_stat <- mod$resample |>
-        select(Resample, RMSE, Rsquared) |>
-        rename(Fold = Resample)
-        summarize(RMSE = mean(RMSE),
-              Rsquared = mean(Rsquared),
-              Fold = "Mean")
-mod_rn_cv_stat <- mod$resample |>
-  select(Fold, RMSE, Rsquared) |>
-  add_row(mod_rn_cv_stat)
-
-print(mod_rn_cv_stat)
 ```
 
-## Spatial cross-validation
+## 2.2 Spatial cross-validation
 View the distribution of data across the globe:
-```{r sourceplot, echo = T}
+```{r sourceplot, echo = F, fig.cap = "Figure 1: Global distribution of observational data.", fig.height=3}
 # get coast outline
 coast <- rnaturalearth::ne_coastline(scale = 110, returnclass = "sf")
 
@@ -161,10 +153,10 @@ ggplot() +
 ```
 The data appears to be spatially biased, with a vast majority of data points in Europe, some in Eastern Asia, and little to none in the rest of the world. The accuracy of a model trained on this data and upscaled to the whole globe will vary over geographical space. Models perform better for data that is similar to the training data. We can assume that geographical distance to observational data points in this case, is a pretty good metric for similar leaf N content. Therefore, the upscaling should work best, where there is a lot of observational data. There might also be geographically distant areas that show similar leaf N and covariates to the observation. There, we should also see a better model performance.
 
-### K-means clustering
-Identify geographical clusters of the data using the k-means algorithm (an unsupervised machine learning method), considering the longitude and latitude of data points and setting. Plot points on a global map, showing the five clusters with distinct colors.
+### 2.2.1 K-means clustering
+The data was partitioned into geographical clusters using the k-means algorithm (an unsupervised machine learning method), considering the longitude and latitude of data points and setting.
 
-```{r}
+```{r k_means_cluster, class.source = "fold-hide", fig.cap="Figure 2: Map of geographical spatial clusters of for 5-fold cross validation.", fig.height=3.5}
 # cluster the data 
 clusters <- kmeans(
   dfs |> dplyr::select(lon, lat),
@@ -186,24 +178,22 @@ ggplot() +
   labs(x = "", y = "") +
   theme(legend.position = "bottom")
 ```
-Some of the clustering seems a bit odd, like the blue cluster with North & South America and Western Europe.
+Some of the clustering seems a bit odd, like the cluster 1 with North & South America and Western Europe.
 
 The distribution of leaf N by cluster looks like this:
-```{r}
+```{r cluster_boxplots, echo = F, fig.cap = "Figure 3: Boxplot showing the distribution of leaf nitrogen content by spatial cluster."}
 ggplot(dfs_cluster, aes(x = factor(cluster), y = leafN, fill = cluster)) +
   geom_boxplot() +
-  labs(title = "Distribution of leaf nitrogen content by cluster",
-       x = "Cluster",
+  labs(x = "Cluster",
        y = "leaf N") +
   scale_fill_discrete(name = "cluster") +
   theme_minimal()
-
 ```
-The clusters do not all look markedly different. Cluster 4 (Western Europe/Americas) and 5 (Central Europe) look very similar. Clusters 2 (Eastern Europe) and 3 (Scandinavia) have lower variance. Cluster 1 (Eastern Asia) has the highest variance.
+The clusters do not all look markedly different. Western Europe/Americas and Central Europe look very similar. Eastern Europe and Scandinavia have lower variance. Eastern Asia has the highest variance.
 
-### Data splitting and model training
+### 2.2.2. Data splitting and model training
 The clusters serve as pre-defined groups for the k-fold-cross-validation.
-```{r}
+```{r spatial_split, class.source = "fold-hide", message = F}
 # create folds based on clusters
 # assuming 'df' contains the data and a column called 'cluster' containing the 
 # result of the k-means clustering
@@ -230,11 +220,11 @@ group_folds_test <- purrr::map(
 )
 ```
 
-```{r}
+A function is created, that trains a random forest model on a given set of rows and predicts on a disjunct set of rows. Then, the function is applied to each custom fold.
+```{r cv_function, class.source = "fold-hide", message = F}
 # create a function that trains a random forest model on a given set of rows and 
 # predicts on a disjunct set of rows
 train_test_by_fold <- function(df, idx_train, idx_test, target, predictors){
-  print("Start training...")
   mod <- ranger::ranger(
     x =  as.data.frame(df[idx_train, predictors]),  # data frame with columns corresponding to predictors
     y =  as.vector(df[idx_train, target])[[1]],   # a vector of the target values (not a data frame!)
@@ -248,19 +238,14 @@ train_test_by_fold <- function(df, idx_train, idx_test, target, predictors){
     num.trees = 500,    # high number ok since no hyperparam tuning
     seed = 32 # for reproducibility
   )
-  print("Training complete. Start predicting...")
   pred <- predict(mod,       # the fitted model object 
                   data = df[idx_test, predictors] # a data frame with columns corresponding to predictors
                   )
-  print("Prediction complete.")
   
   compare <- data.frame(df[idx_test, target], pred$predictions)
   names(compare) <- c("obs", "pred")
   rsq <- yardstick::rsq(data = compare, estimate = pred, truth = obs)$.estimate # the R-squared determined on the validation set
   rmse <- yardstick::rmse(data = compare, estimate = pred, truth = obs)$.estimate # the root mean square error on the validation set
-  
-  print(rsq)
-  print(rmse)
   
   return(data.frame(rsq = rsq, rmse = rmse))
 }
@@ -273,35 +258,25 @@ mod_spat_cv_stat <- purrr::map2_dfr(
   ~train_test_by_fold(dfs, .x, .y, target, predictors_all)
 ) |>
   dplyr::mutate(test_fold = 1:5)
-
-print(mod_spat_cv_stat)
-```
-
-```{r}
-
 ```
 
 
-Split your data into five folds that correspond to the geographical clusters identified by in (2.), and fit a random forest model with the same hyperparameters as above and performing a 5-fold cross-validation with the clusters as folds. Report the RMSE and the R
-determined on each of the five folds
-Compare the results of the spatial cross-validation to the results of the random cross-validation and discuss reasons for why you observe a difference in the cross-validation metrics (if you do).
 
 
 
+## 2.3 Environmental cross-validation
+For the third cross-validation, we consider five clusters of points in environmental space (or feature space) - spanned by the mean annual precipitation and the mean annual temperature. 
 
-## Environmental cross-validation
-
-    Perform a custom cross-validation as above, but this time considering five clusters of points not in geographical space, but in environmental space - spanned by the mean annual precipitation and the mean annual temperature. Report the R-squared and the RMSE on the validation set of each of the five folds.
-
-    Compare the results of the environmental cross-validation to the results of the random and the spatial cross-validation and discuss reasons for why you observe a difference in the cross-validation metrics (if you do).
-
-### K-means clustering
-```{r}
+### 2.3.1 K-means clustering
+```{r cluster_env, class.source = "fold-hide", message = F}
 # cluster the data 
 clusters <- kmeans(
   dfs |> dplyr::select(mat, map),
   centers = 5
 )
+```
+
+```{r map_cluster_env, echo = F, fig.cap = "Figure 4: Map of environmental / feature space clusters for 5-fold cross validation.", fig.height=3.5}
 
 dfs_env <- dfs |>
   dplyr::mutate(cluster = as.factor(clusters$cluster))
@@ -317,14 +292,18 @@ ggplot() +
   geom_point(data = dfs_env, aes(x = lon, y = lat, color = cluster),  size = 0.2) +
   labs(x = "", y = "") +
   theme(legend.position = "bottom")
+```
 
+```{r plot_cluster_env, echo = F, fig.cap = "Figure 5: Plot of environmental clusters spanned between mean annual temperature [°C] and mean annual precipitation [mm]."}
 ggplot() +
   geom_point(data=dfs_env, aes(x = map, y = mat, color = cluster)) +
-  labs(x = "Mean annual precipitation [mm]", y = "Mean annual temperature [°C")
+  labs(x = "Mean annual precipitation [mm]", y = "Mean annual temperature [°C]")
 ```
-It seems that the clusters are created only according to precipitation, although temperature is given as an argument in the formula too. This happens, because the data is not normalized and the precipitation has a much larger value range than the temperature. Keep that in mind for later.
 
-```{r}
+It seems that the clusters are created only according to precipitation, although temperature is given as an argument in the formula too. This happens, because the data is not normalized and the precipitation has a much larger value range than the temperature.
+
+### 2.3.2. Data splitting and model training
+```{r env_cross_validation, class.source = "fold-hide", message = F}
 # create folds based on clusters
 # assuming 'df' contains the data and a column called 'cluster' containing the 
 # result of the k-means clustering
@@ -349,8 +328,6 @@ group_folds_test <- purrr::map(
       pull(idx)
   }
 )
-
-
 # apply function on each custom fold and collect validation results in a nice data frame
 mod_env_cv_stat <- purrr::map2_dfr(
   group_folds_train,
@@ -358,8 +335,78 @@ mod_env_cv_stat <- purrr::map2_dfr(
   ~train_test_by_fold(dfs_env, .x, .y, target, predictors_all)
 ) |>
   dplyr::mutate(test_fold = 1:5)
-
-print(mod_env_cv_stat)
 ```
 
-# Results and Discussion
+# 3. Results and Discussion
+```{r mod_stats, echo = F, message = F}
+# Summary tabel of random CV
+mod_rn_cv_stat <- mod_rn_cv$resample |>
+        select(Resample, RMSE, Rsquared) |>
+        rename(Fold = Resample) |>
+        dplyr::summarize(RMSE = mean(RMSE),
+              Rsquared = mean(Rsquared),
+              Fold = "Mean")
+mod_rn_cv_stat <- mod_rn_cv$resample |>
+  select(Resample, RMSE, Rsquared) |>
+  rename(Fold = Resample) |>
+  add_row(mod_rn_cv_stat) |>
+  mutate(RMSE = round(RMSE, digits = 3),
+         Rsquared = round(Rsquared, digits = 3), 
+         Fold = c(1:5, "mean"))
+
+knitr::kable(mod_rn_cv_stat,
+caption = "Table 1: Error metrics of random 5-fold cross-validation")
+
+# Summary table of spatial CV
+mod_spat_cv_stat <- mod_spat_cv_stat |>
+  mutate(Fold = as.character(test_fold), 
+         RMSE = round(rmse, digits = 3),
+         Rsquared = round(rsq, digits = 3)) |>
+  dplyr::select(-rmse, -rsq, -test_fold)
+
+mod_spat_cv_stat_mean <- mod_spat_cv_stat |>
+        dplyr::summarize(Fold = "mean",
+              RMSE = mean(RMSE),
+              Rsquared = mean(Rsquared))
+
+mod_spat_cv_stat <- mod_spat_cv_stat |>
+  add_row(mod_spat_cv_stat_mean)
+
+print(mod_spat_cv_stat)
+
+knitr::kable(mod_spat_cv_stat,
+caption = "Table 2: Error metrics of spatial 5-fold cross-validation")
+
+# Summary table of spatial CV
+mod_env_cv_stat <- mod_env_cv_stat |>
+  mutate(Fold = as.character(test_fold), 
+         RMSE = round(rmse, digits = 3),
+         Rsquared = round(rsq, digits = 3)) |>
+  dplyr::select(-rmse, -rsq, -test_fold)
+
+mod_env_cv_stat_mean <- mod_env_cv_stat |>
+        dplyr::summarize(Fold = "mean",
+              RMSE = mean(RMSE),
+              Rsquared = mean(Rsquared))
+
+mod_env_cv_stat <- mod_env_cv_stat |>
+  add_row(mod_env_cv_stat_mean)
+
+print(mod_env_cv_stat)
+
+knitr::kable(mod_env_cv_stat,
+caption = "Table 3: Error metrics of environmental 5-fold cross-validation")
+```
+
+The error metrics of the three models trained on different cross-validation methods, are summarized in Table 1 (random CV), Table 2 (spatial CV), and Table 3 (environmental CV). 
+
+The random cross-validated model performed overall, but also in the individual folds, by far the best with a mean RMSE of 2.35 and a mean Rsquared of 0.79. The model with environmental CV was the second best (mean RMSE = 3.46, mean Rsquared = 0.53) and the model with spatial CV performed the worst (mean RMSE = 3.86, mean Rsquared = 0.38). This is in line with the results from Ludwig et al. (2023). 
+
+It can be explained by the data representation in each fold: the random model should have a more or less even range over the covariate space of the observational data, and therefore, the folds that are used for testing contain not much "unseen" or highly dissimilar data. Contrarily, the folds of the spatial and environmental CVs are much more dissimilar from each other and are prone to overfitting. They also show higher variance in RMSE and Rsquared between the different folds, with spatial CV even displaying the overall highest RMSE in fold and overall lowest RMSE in another. 
+
+This shows the importance of defining an area of applicability, like Ludwig et al. (2023) propose, to avoid making predictions in an area that doesn't have similar enough reference data. 
+
+It seems a bit counter-intuitive to me, that the environmental CV performs better and is thus less prone to spatial overfitting than the spatial CV. I would have expected that geographical closeness is not necessarily a better clustering basis than environmental similarity. But perhaps this can be attributed to the choice of environmental covariates (mean annual temperature and precipitation). Firstly, the variables were not normalized, causing the clustering to be much more dependent on precipitation than temperature. And secondly, these may not be the most distinctive variables to describe a local environment. A comparison with other covariate tuples, or with more than two covariates for clustering could be interesting.
+
+# References
+Ludwig, M., Moreno-Martinez, A., Hölzel, N., Pebesma, E., & Meyer, H. (2023). Assessing and improving the transferability of current global spatial prediction models. Global Ecology and Biogeography, 32, 356–368. https://doi.org/10.1111/geb.13635
