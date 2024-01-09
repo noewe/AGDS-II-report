@@ -3,6 +3,9 @@ This repository contains the exercises and reports I made during the course
 Applied Geodata Science II, at the University of Bern, 
 during the fall semester 2023.
 
+The exercises Digital Soil Mapping and Spatial upscaling are handed in as graded
+exercises.
+
 # Credits 
 Credits for the course material and teaching go to Prof. Dr. Benjamin Stocker 
 and Dr. Koen Hufkens from the research group for Geocomputation and Earth 
